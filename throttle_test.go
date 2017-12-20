@@ -7,57 +7,108 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"io/ioutil"
 	"io"
+	"log"
+	"sync/atomic"
 )
 
-func Test_sleep_reader_shared_key(t *testing.T) {
-	var totalN int
-	var spend time.Duration
-	var eta time.Duration
-	var now time.Time
-	var readMaker func() io.Reader
-
-	totalSize := 1024 * 1024 * 2
-	rateLimitBPS := 512 * 1024
-	count := 3
-
-	blob := make([]byte, totalSize)
-
-	readMaker = func() io.Reader {
-		return NewSleepReader(bytes.NewReader(blob), rateLimitBPS, "Test_sleep_reader_shared_key")
-	}
-
-	totalN, spend = multiRead(count, readMaker, rateLimitBPS, totalSize/count)
-
-	now = time.Now()
-	eta = time.Second * time.Duration(totalN) / time.Duration(rateLimitBPS)
-
-	fmt.Println("total", totalN, "spend", spend, "eta", eta, "eta-spend:", eta-spend)
-	assert.WithinDuration(t, now.Add(eta), now.Add(spend), eta/time.Duration(10), "偏差不超过10%")
+type testReader struct {
+	Read ReadWriteFunc
 }
 
-func Test_sleep_writer_shared_key(t *testing.T) {
-	var totalN int
-	var spend time.Duration
-	var eta time.Duration
-	var now time.Time
-	var writeMaker func() io.Writer
+type testWriter struct {
+	Write ReadWriteFunc
+}
 
+type mockReader struct {
+	read ReadWriteFunc
+}
+
+func (r *mockReader) Read(b []byte) (n int, e error) {
+	return r.read(b)
+}
+
+func newMockReader(read ReadWriteFunc) (io.Reader) {
+	return &mockReader{read: read}
+}
+
+func TestSingleSleepLimit(t *testing.T) {
+	// 一个Reader
 	totalSize := 1024 * 1024 * 2
 	rateLimitBPS := 512 * 1024
-	count := 3
 
-	writeMaker = func() io.Writer {
-		return NewSleepWriter(&bytes.Buffer{}, rateLimitBPS, "Test_sleep_writer_shared_key")
+	bin := make([]byte, totalSize)
+	buf := bytes.NewBuffer(bin)
+
+	rd := newMockReader(SleepLimit(buf.Read, rateLimitBPS, ""))
+
+	now := time.Now()
+	bout, _ := ioutil.ReadAll(rd)
+	lapsed := time.Now().Sub(now)
+	eta := time.Second * time.Duration(totalSize) / time.Duration(rateLimitBPS)
+
+	log.Printf("input/output=%d/%d, lapsed=%v, eta=%v, delta=%v(%.0f%%)",
+		totalSize, len(bout), lapsed, eta, eta-lapsed, float64(lapsed-eta)/float64(eta)*100)
+
+	assert.WithinDuration(t, now.Add(eta), now.Add(lapsed), eta/time.Duration(10), "偏差不超过10%")
+}
+
+func TestSharedSleepLimit(t *testing.T) {
+	// 多个同样key的reader，并行读取，共同限速
+	totalSize := 1024 * 1024
+	rateLimitBPS := 512 * 1024
+	concurrent := 2
+
+	var wg sync.WaitGroup
+	wg.Add(concurrent)
+
+	var totalSizeOut uint32 = 0
+	for i := 0; i < concurrent; i++ {
+		go func() {
+			bin := make([]byte, totalSize)
+			buf := bytes.NewBuffer(bin)
+			rd := newMockReader(SleepLimit(buf.Read, rateLimitBPS, "TestSharedSleepLimit"))
+			bout, _ := ioutil.ReadAll(rd)
+			atomic.AddUint32(&totalSizeOut, uint32(len(bout)))
+			wg.Done()
+		}()
 	}
 
-	totalN, spend = multiSend(count, writeMaker, rateLimitBPS, totalSize/count)
+	now := time.Now()
+	wg.Wait()
+	lapsed := time.Now().Sub(now)
+	eta := time.Second * time.Duration(totalSize) / time.Duration(rateLimitBPS) * time.Duration(concurrent)
 
-	now = time.Now()
-	eta = time.Second * time.Duration(totalN) / time.Duration(rateLimitBPS)
+	log.Printf("input/output=%d/%d, lapsed=%v, eta=%v, delta=%v(%.0f%%)",
+		totalSize*concurrent, totalSizeOut, lapsed, eta, eta-lapsed, float64(lapsed-eta)/float64(eta)*100)
 
-	fmt.Println("total", totalN, "spend", spend, "eta", eta, "eta-spend:", eta-spend)
-	assert.WithinDuration(t, now.Add(eta), now.Add(spend), eta/time.Duration(10), "偏差不超过10%")
+	assert.WithinDuration(t, now.Add(eta), now.Add(lapsed), eta/time.Duration(10), "偏差不超过10%")
+}
+
+func TestSingleDiscardLimit(t *testing.T) {
+	// 一个Reader
+	totalSize := 1024 * 1024 * 20
+	rateLimitBPS := 1024 * 1024 * 10
+
+	bin := make([]byte, totalSize)
+	buf := bytes.NewBuffer(bin)
+	readDelay := time.Millisecond * 60
+	rd := newMockReader(DiscardLimit(func(b []byte) (int, error) {
+		n, e := buf.Read(b)
+		time.Sleep(readDelay)
+		return n, e
+	}, rateLimitBPS, ""))
+
+	now := time.Now()
+	bout, _ := ioutil.ReadAll(rd)
+	lapsed := time.Now().Sub(now)
+	eta := time.Second * time.Duration(len(bout)) / time.Duration(rateLimitBPS)
+
+	log.Printf("input/output=%d/%d, lapsed=%v, eta=%v, delta=%v(%.0f%%)",
+		totalSize, len(bout), lapsed, eta, eta-lapsed, float64(lapsed-eta)/float64(eta)*100)
+
+	assert.WithinDuration(t, now.Add(eta), now.Add(lapsed), eta/time.Duration(10), "偏差不超过10%")
 }
 
 func Test_discard_reader_shared_key(t *testing.T) {
@@ -66,7 +117,7 @@ func Test_discard_reader_shared_key(t *testing.T) {
 	var eta time.Duration
 	var now time.Time
 	var speed int
-	var readMaker func() io.Reader
+	var readMaker func() *testReader
 
 	totalSize := 1024 * 1024 * 2
 	rateLimitBPS := 512 * 1024 // bps
@@ -78,8 +129,10 @@ func Test_discard_reader_shared_key(t *testing.T) {
 	count := 3
 
 	// 低速
-	readMaker = func() io.Reader {
-		return NewDiscardReader(bytes.NewReader(blob), rateLimitBPS, "Test_discard_reader_shared_key_1")
+	readMaker = func() *testReader {
+		return &testReader{
+			Read: DiscardLimit(bytes.NewReader(blob).Read, rateLimitBPS, "Test_discard_reader_shared_key_1"),
+		}
 	}
 
 	speed = (rateLimitBPS - 128*1024) / count
@@ -92,8 +145,10 @@ func Test_discard_reader_shared_key(t *testing.T) {
 	assert.WithinDuration(t, now.Add(eta), now.Add(spend), eta/time.Duration(10), "偏差不超过10%")
 
 	// 高速
-	readMaker = func() io.Reader {
-		return NewDiscardReader(bytes.NewReader(blob), rateLimitBPS, "Test_discard_reader_shared_key_2")
+	readMaker = func() *testReader {
+		return &testReader{
+			Read: DiscardLimit(bytes.NewReader(blob).Read, rateLimitBPS, "Test_discard_reader_shared_key_2"),
+		}
 	}
 
 	speed = (rateLimitBPS + 128*1024) / count
@@ -111,7 +166,7 @@ func Test_discard_writer_shared_key(t *testing.T) {
 	var spend time.Duration
 	var eta time.Duration
 	var now time.Time
-	var writeMaker func() io.Writer
+	var writeMaker func() *testWriter
 	var speed int
 
 	totalSize := 1024 * 1024 * 2
@@ -119,12 +174,14 @@ func Test_discard_writer_shared_key(t *testing.T) {
 	count := 3
 
 	//低速通过
-	writeMaker = func() io.Writer {
-		return NewDiscardWriter(&bytes.Buffer{}, rateLimitBPS, "Test_discard_writer_single_shared_key_1")
+	writeMaker = func() *testWriter {
+		return &testWriter{
+			Write: SleepLimit(bytes.NewBuffer(nil).Write, rateLimitBPS, "Test_discard_writer_single_shared_key_1"),
+		}
 	}
 
 	speed = (rateLimitBPS - 128*1024) / count
-	totalN, spend = multiSend(count, writeMaker, speed, totalSize/count)
+	totalN, spend = multiWrite(count, writeMaker, speed, totalSize/count)
 
 	now = time.Now()
 	eta = time.Second * time.Duration(totalN) / time.Duration(speed*count) // 期望以低速为准
@@ -133,12 +190,14 @@ func Test_discard_writer_shared_key(t *testing.T) {
 	assert.WithinDuration(t, now.Add(eta), now.Add(spend), eta/time.Duration(10), "偏差不超过10%")
 
 	// 高速丢弃
-	writeMaker = func() io.Writer {
-		return NewDiscardWriter(&bytes.Buffer{}, rateLimitBPS, "Test_discard_writer_single_shared_key_2")
+	writeMaker = func() *testWriter {
+		return &testWriter{
+			Write: SleepLimit(bytes.NewBuffer(nil).Write, rateLimitBPS, "Test_discard_writer_single_shared_key_2"),
+		}
 	}
 
 	speed = (rateLimitBPS + 128*1024) / count
-	totalN, spend = multiSend(count, writeMaker, speed, totalSize)
+	totalN, spend = multiWrite(count, writeMaker, speed, totalSize)
 
 	now = time.Now()
 	eta = time.Second * time.Duration(totalN) / time.Duration(rateLimitBPS)
@@ -147,7 +206,7 @@ func Test_discard_writer_shared_key(t *testing.T) {
 	assert.WithinDuration(t, now.Add(eta), now.Add(spend), eta/time.Duration(10), "偏差不超过10%")
 }
 
-func read(rd io.Reader, speed int, totalSize int) (int, time.Duration) {
+func read(rd *testReader, speed int, totalSize int) (int, time.Duration) {
 	sum := 0
 	readDuration := 100 * time.Millisecond
 	readSize := speed / int(time.Second/readDuration)
@@ -168,7 +227,7 @@ func read(rd io.Reader, speed int, totalSize int) (int, time.Duration) {
 	return sum, spend
 }
 
-func multiRead(count int, readMaker func() io.Reader, speed int, totalSize int) (int, time.Duration) {
+func multiRead(count int, readMaker func() *testReader, speed int, totalSize int) (int, time.Duration) {
 	wg := sync.WaitGroup{}
 
 	wg.Add(count)
@@ -190,7 +249,7 @@ func multiRead(count int, readMaker func() io.Reader, speed int, totalSize int) 
 	return totalN, spend
 }
 
-func send(w io.Writer, speed int, blob []byte) (int, time.Duration) {
+func write(w *testWriter, speed int, blob []byte) (int, time.Duration) {
 	sum := 0
 	totalSize := len(blob)
 	sendDuration := 100 * time.Millisecond
@@ -212,7 +271,7 @@ func send(w io.Writer, speed int, blob []byte) (int, time.Duration) {
 	return sum, spend
 }
 
-func multiSend(count int, writeMaker func() io.Writer, speed int, totalSize int) (int, time.Duration) {
+func multiWrite(count int, writeMaker func() *testWriter, speed int, totalSize int) (int, time.Duration) {
 	wg := sync.WaitGroup{}
 
 	wg.Add(count)
@@ -224,7 +283,7 @@ func multiSend(count int, writeMaker func() io.Writer, speed int, totalSize int)
 		go func() {
 			w := writeMaker()
 			// 确保原子操作
-			n, _ := send(w, speed, blob)
+			n, _ := write(w, speed, blob)
 			totalN += n
 			wg.Done()
 		}()
